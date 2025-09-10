@@ -60,7 +60,7 @@ def cmd_sendnow(update, context):
 
 # ------------- Jobs -------------
 def job_daily(context):
-    msg = build_daily_message()
+    msg = build_daily_message()from picks import build_daily_message, build_status
     context.bot.send_message(chat_id=CHANNEL_ID, text=msg, parse_mode="Markdown")
     _mark_sent_today()
 
