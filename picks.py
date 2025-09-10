@@ -1,5 +1,3 @@
-# picks.py — génération des pronostics formatés SAFE / MEDIUM / RISKY
-
 import os, requests, datetime
 
 THEODDS_KEY = os.getenv("THEODDS_API_KEY")
@@ -7,7 +5,7 @@ REGIONS = os.getenv("ODDS_REGIONS", "eu,us,uk")
 MARKETS = "h2h"
 ODDS_FMT = "decimal"
 
-# ⚽ Top ligues Europe + sports populaires
+# Ligues & sports
 SPORT_KEYS = [
     "soccer_epl",
     "soccer_spain_la_liga",
@@ -20,28 +18,44 @@ SPORT_KEYS = [
     "rugby_union_international",
 ]
 
-# Seuils de classification (tu peux ajuster)
-SAFE_PROB = 0.63          # ≥ 63% ≈ cote <= 1.59 (après normalisation)
+# Seuils / objectifs
+SAFE_PROB = 0.63          # proba normalisée
 SAFE_EDGE = 0.020         # +2.0% d'edge
-MEDIUM_PROB_LOW = 0.55    # 55%–63%
-MEDIUM_EDGE = 0.010       # +1.0% d'edge
+MEDIUM_PROB_LOW = 0.55
+MEDIUM_EDGE = 0.010
 
-# Répartition cible (modifie si tu veux)
 TARGET_SAFE = 3
 TARGET_MED = 2
-TARGET_TOTAL = 6  # total minimum envoyé
+TARGET_TOTAL = 6
 
+# Unités de mise (bankroll % indicatif)
+UNITS = {"safe": "1.0u", "medium": "0.7u", "risky": "0.4u"}
 
 def _get(url, params=None):
     r = requests.get(url, params=params, timeout=25)
     r.raise_for_status()
     return r.json()
 
+def _fmt_ts(ts):
+    try:
+        dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.strftime("%d/%m %H:%M UTC")
+    except Exception:
+        return ""
+
+def _label(p):
+    prob = p["prob"]; edge = p["edge"]
+    if (prob >= SAFE_PROB) or (prob >= 0.60 and edge >= SAFE_EDGE):
+        return "safe"
+    if (MEDIUM_PROB_LOW <= prob < SAFE_PROB) or (edge >= MEDIUM_EDGE):
+        return "medium"
+    return "risky"
+
+def _badge(label):
+    return {"safe": "✅ SAFE", "medium": "⚡ MEDIUM", "risky": "🎲 RISKY"}[label]
 
 def fetch_events_for_sport(sport_key):
-    """Récupère les rencontres + cotes moyennes et calcule probas/edge."""
-    if not THEODDS_KEY:
-        return []
+    if not THEODDS_KEY: return []
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {"apiKey": THEODDS_KEY, "regions": REGIONS, "markets": MARKETS, "oddsFormat": ODDS_FMT}
     try:
@@ -51,138 +65,113 @@ def fetch_events_for_sport(sport_key):
 
     out = []
     for ev in data:
-        prices_by_outcome = {}
+        # moyenne des cotes
+        prices = {}
         for bk in ev.get("bookmakers", []):
             for mk in bk.get("markets", []):
-                if mk.get("key") != "h2h":
-                    continue
+                if mk.get("key") != "h2h": continue
                 for o in mk.get("outcomes", []):
-                    prices_by_outcome.setdefault(o["name"], []).append(o["price"])
-        if not prices_by_outcome:
-            continue
+                    prices.setdefault(o["name"], []).append(o["price"])
+        if not prices: continue
+        avg = {k: sum(v)/len(v) for k,v in prices.items()}
 
-        # moyenne des cotes par issue
-        avg_price = {name: sum(v) / len(v) for name, v in prices_by_outcome.items()}
         # proba implicite normalisée
-        imp = {name: 1.0 / p for name, p in avg_price.items()}
-        s = sum(imp.values())
-        probs = {name: v / s for name, v in imp.items()}
+        imp = {k: 1.0/p for k,p in avg.items()}
+        s = sum(imp.values()); probs = {k: v/s for k,v in imp.items()}
 
-        # favori
-        pick_team, pick_prob = max(probs.items(), key=lambda x: x[1])
-        pick_price = avg_price[pick_team]
+        pick, prob = max(probs.items(), key=lambda x: x[1])
+        price = avg[pick]
+        edge = prob - (1.0/price)
 
-        # edge simple = proba - break-even (1/price)
-        edge = pick_prob - (1.0 / pick_price)
-
-        # petit bonus domicile (foot seulement)
-        home_team = ev.get("home_team")
-        away_team = ev.get("away_team")
-        is_home_fav = (pick_team == home_team)
-        score = pick_prob * 100.0 + (edge * 100.0)
-        if is_home_fav and "soccer" in sport_key:
-            score += 2.0
+        home, away = ev.get("home_team"), ev.get("away_team")
+        is_home = (pick == home)
+        score = prob*100 + edge*100 + (2.0 if ("soccer" in sport_key and is_home) else 0.0)
 
         out.append({
             "sport": sport_key,
-            "home": home_team,
-            "away": away_team,
-            "pick": pick_team,
-            "price": pick_price,
-            "prob": pick_prob,
-            "edge": edge,
+            "home": home, "away": away,
+            "pick": pick, "price": price,
+            "prob": prob, "edge": edge,
             "score": score,
-            "commence": ev.get("commence_time", "")
+            "commence": ev.get("commence_time","")
         })
     return out
 
-
-def fmt_ts(ts):
-    try:
-        dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return dt.strftime("%d/%m %H:%M UTC")
-    except Exception:
-        return ""
-
-
-def label_for(p):
-    """Retourne ('safe'|'medium'|'risky') selon prob/edge."""
-    prob = p["prob"]
-    edge = p["edge"]
-    if (prob >= SAFE_PROB) or (prob >= 0.60 and edge >= SAFE_EDGE):
-        return "safe"
-    if (MEDIUM_PROB_LOW <= prob < SAFE_PROB) or (edge >= MEDIUM_EDGE):
-        return "medium"
-    return "risky"
-
-
-def collect_all():
+def _collect_all():
     events = []
-    if not THEODDS_KEY:
-        return []
-    for key in SPORT_KEYS:
-        events += fetch_events_for_sport(key)
-    # trier par score décroissant (les plus pertinents en premier)
+    for k in SPORT_KEYS:
+        events += fetch_events_for_sport(k)
     events.sort(key=lambda x: (x["score"], x["prob"]), reverse=True)
     return events
 
-
-def build_daily_message():
-    if not THEODDS_KEY:
-        return ("*📊 Pronostics du jour*\n"
-                "_Ajoute THEODDS_API_KEY dans Render → Environment pour activer les picks._")
-
-    all_events = collect_all()
-    if not all_events:
-        return "*📊 Pronostics du jour*\n_Pas de matchs exploitables trouvés aujourd'hui._"
-
-    # Grouper par label
+def _select_vip():
+    """Retourne (chosen, stats) où chosen est la liste finale ordonnée."""
+    all_events = _collect_all()
     groups = {"safe": [], "medium": [], "risky": []}
     for p in all_events:
-        groups[label_for(p)].append(p)
+        groups[_label(p)].append(p)
 
-    # Sélection : priorité SAFE puis MEDIUM puis RISKY, en respectant TARGETS
     chosen = []
     chosen += groups["safe"][:TARGET_SAFE]
     chosen += groups["medium"][:TARGET_MED]
-    # compléter jusqu'à TARGET_TOTAL avec le reste des meilleurs
     if len(chosen) < TARGET_TOTAL:
         pool = groups["safe"][TARGET_SAFE:] + groups["medium"][TARGET_MED:] + groups["risky"]
         pool.sort(key=lambda x: (x["score"], x["prob"]), reverse=True)
-        need = max(0, TARGET_TOTAL - len(chosen))
-        chosen += pool[:need]
+        chosen += pool[:(TARGET_TOTAL - len(chosen))]
 
-    # Construire le message avec sections
-    sections = {"safe": [], "medium": [], "risky": []}
-    for p in chosen:
-        prob = int(round(p["prob"] * 100))
-        when = fmt_ts(p["commence"])
-        vs = f"{p['home']} vs {p['away']}"
-        line = (f"• *{p['pick']}* — {vs}\n"
-                f"  Cote moy: {p['price']:.2f}  | Confiance≈ {prob}%"
-                f"{('  | Match ' + when) if when else ''}")
-        sections[label_for(p)].append(line)
+    stats = {
+        "scanned": len(all_events),
+        "safe": len(groups["safe"]),
+        "medium": len(groups["medium"]),
+        "risky": len(groups["risky"]),
+        "selected": len(chosen),
+    }
+    return chosen, stats
 
+def build_daily_message():
+    if not THEODDS_KEY:
+        return ("*📣 Configuration requise*\n"
+                "_Ajoute THEODDS_API_KEY dans Render → Environment pour activer les picks._")
+
+    picks, stats = _select_vip()
+    if not picks:
+        return "*📊 VIP Picks*\n_Aucun match exploitable trouvé aujourd’hui._"
+
+    # Titre VIP
+    today = datetime.datetime.utcnow().strftime("%d %b %Y")
     lines = []
-    today = datetime.datetime.utcnow().strftime("%d %B").title()
-    lines.append(f"*📊 Pronostics du jour — {today}*")
+    lines.append(f"*👑 VIP Picks — {today}*")
+    lines.append("_Modèle : proba implicite multi-books + edge + bonus domicile (foot)_")
     lines.append("")
 
-    if sections["safe"]:
-        lines.append("✅ *SAFE BETS*")
-        lines += sections["safe"]
+    # Sections
+    for p in picks:
+        label = _label(p)
+        badge = _badge(label)
+        units = UNITS[label]
+        prob = int(round(p["prob"]*100))
+        edge = int(round(p["edge"]*1000))/10  # ex: 2.3%
+        when = _fmt_ts(p["commence"])
+        vs = f"{p['home']} vs {p['away']}"
+        lines.append(
+            f"{badge} · *{units}*\n"
+            f"• *{p['pick']}* — {vs}\n"
+            f"  Cote: *{p['price']:.2f}* | Confiance≈ *{prob}%* | Edge≈ *{edge}%*"
+            f"{(' | ' + when) if when else ''}"
+        )
         lines.append("")
 
-    if sections["medium"]:
-        lines.append("⚡ *MEDIUM BETS*")
-        lines += sections["medium"]
-        lines.append("")
-
-    if sections["risky"]:
-        lines.append("🎲 *RISKY BETS*")
-        lines += sections["risky"]
-        lines.append("")
-
+    # Footer
     lines.append("—")
-    lines.append("💡 *Gestion du risque:* mise 1–2% par pari. Pas de martingale.")
+    lines.append("💼 *Gestion* : 1–2% bankroll par pari (unités ci-dessus).")
+    lines.append("📌 *Avertissement* : les paris comportent des risques. Joue responsable.")
     return "\n".join(lines)
+
+def build_status():
+    """Petit résumé VIP pour /status."""
+    if not THEODDS_KEY:
+        return "*Status* : clé THEODDS_API_KEY manquante."
+    _, st = _select_vip()
+    return (f"*Status VIP*\n"
+            f"Scannés: *{st['scanned']}* | Sélectionnés: *{st['selected']}*\n"
+            f"Répartition: ✅ {st['safe']} · ⚡ {st['medium']} · 🎲 {st['risky']}")
