@@ -1,11 +1,11 @@
-import os, requests, math, datetime
+import os, requests, datetime
 
-THEODDS_KEY = os.getenv("THEODDS_API_KEY") or os.getenv("ODDS_API_KEY")
-REGIONS = os.getenv("ODDS_REGIONS", "eu,us,uk")     # marchés consultés
-MARKETS = "h2h"                                     # 1X2 / moneyline
+THEODDS_KEY = os.getenv("THEODDS_API_KEY")
+FD_KEY = os.getenv("FD_API_KEY")  # clé Football-Data
+REGIONS = os.getenv("ODDS_REGIONS", "eu,us,uk")
+MARKETS = "h2h"
 ODDS_FMT = "decimal"
 
-# Liste de sports TheOddsAPI à couvrir (tu peux en ajouter/retirer)
 SPORT_KEYS = [
     "soccer_epl", "soccer_france_ligue_one", "soccer_uefa_champs_league",
     "basketball_nba",
@@ -14,87 +14,83 @@ SPORT_KEYS = [
     "rugby_union_international"
 ]
 
-def _get(url, params=None):
-    r = requests.get(url, params=params, timeout=20)
+def _get(url, headers=None, params=None):
+    r = requests.get(url, headers=headers, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
 
 def fetch_events_for_sport(sport_key):
+    if not THEODDS_KEY:
+        return []
     base = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {"apiKey": THEODDS_KEY, "regions": REGIONS, "markets": MARKETS, "oddsFormat": ODDS_FMT}
     try:
-        data = _get(base, params)
+        data = _get(base, params=params)
     except Exception:
         return []
     events = []
     for ev in data:
-        # Chaque bookmaker propose des cotes; on prend la moyenne par outcome
         outcomes = {}
-        count = 0
         for bk in ev.get("bookmakers", []):
             for mk in bk.get("markets", []):
                 if mk.get("key") != "h2h":
                     continue
-                count += 1
                 for o in mk.get("outcomes", []):
                     outcomes.setdefault(o["name"], []).append(o["price"])
-        if not outcomes or count == 0:
+        if not outcomes:
             continue
         avg = {name: sum(prices)/len(prices) for name, prices in outcomes.items()}
-        # Convertir en probas implicites
-        imp = {name: 1.0/price for name, price in avg.items()}
-        norm = sum(imp.values())
-        probs = {name: v/norm for name, v in imp.items()}
-
-        # On prend le favori (plus haute proba), c'est notre pick baseline
-        best_team, best_prob = max(probs.items(), key=lambda x: x[1])
-        best_price = avg[best_team]
-        # "Edge" très simple: prob - break-even (=1/price)
-        edge = best_prob - (1.0/best_price)
-
+        fav = min(avg, key=avg.get)
         events.append({
             "sport": sport_key,
-            "commence": ev.get("commence_time", ""),
             "home": ev.get("home_team"),
             "away": ev.get("away_team"),
-            "pick": best_team,
-            "price": best_price,
-            "prob": best_prob,
-            "edge": edge
+            "fav": fav,
+            "price": avg[fav],
+            "commence": ev.get("commence_time")
         })
     return events
 
-def pick_top_n(n=6):
-    all_events = []
-    if not THEODDS_KEY:
-        # Pas de clé -> message placeholder
-        return [{"sport":"INFO","pick":"Ajoute THEODDS_API_KEY dans Railway Variables","price":0,"prob":0.0,"edge":0.0,
-                 "home":"","away":"","commence":""} for _ in range(n)]
-    for key in SPORT_KEYS:
-        all_events += fetch_events_for_sport(key)
-    # Trier par score "edge" + prob (favoris plus clairs d'abord)
-    all_events.sort(key=lambda x: (x["edge"], x["prob"]), reverse=True)
-    return all_events[:n] if len(all_events) >= n else all_events
-
-def fmt_ts(ts):
+def fetch_team_form(team):
+    """Analyse forme sur Football-Data (5 derniers matchs)"""
+    if not FD_KEY:
+        return None
     try:
-        # 2025-09-11T09:30:00Z
-        dt = datetime.datetime.fromisoformat(ts.replace("Z","+00:00"))
-        return dt.strftime("%d/%m %H:%M UTC")
+        url = f"https://api.football-data.org/v4/teams/{team}/matches?status=FINISHED&limit=5"
+        headers = {"X-Auth-Token": FD_KEY}
+        matches = _get(url, headers=headers).get("matches", [])
+        if not matches:
+            return None
+        pts = 0
+        for m in matches:
+            if m["score"]["winner"] == "HOME_TEAM" and m["homeTeam"]["id"] == team:
+                pts += 3
+            elif m["score"]["winner"] == "AWAY_TEAM" and m["awayTeam"]["id"] == team:
+                pts += 3
+            elif m["score"]["winner"] == "DRAW":
+                pts += 1
+        return round(pts / (len(matches)*3), 2)  # ratio 0-1
     except Exception:
-        return ""
+        return None
 
 def build_daily_message():
-    picks = pick_top_n(6)
     lines = []
-    lines.append("*🔥 Sélection IA – 6 pronostics du jour (18h Sydney)*")
-    for i, p in enumerate(picks, 1):
-        prob = int(round(p["prob"]*100)) if p["prob"] else 0
-        edge = int(round(p["edge"]*10000))/100 if p["edge"] else 0.0  # en %
-        vs = f"{p['home']} vs {p['away']}" if p["home"] and p["away"] else ""
-        when = fmt_ts(p["commence"])
+    lines.append("*🔥 Sélection IA – Pronostics du jour (18h Sydney)*")
+    picks = []
+    for sport in SPORT_KEYS:
+        picks += fetch_events_for_sport(sport)
+    top = picks[:6] if len(picks) >= 6 else picks
+
+    for i, p in enumerate(top, 1):
+        form_info = ""
+        if "soccer" in p["sport"] and FD_KEY:
+            form_val = fetch_team_form(p["fav"])
+            if form_val is not None:
+                form_info = f" | Forme={int(form_val*100)}%"
+        vs = f"{p['home']} vs {p['away']}"
+        when = p["commence"].replace("T", " ").replace("Z", " UTC")
         lines.append(f"*{i}. {p['sport']}* — {vs}\n"
-                     f"• Pick: *{p['pick']}*  | Cote moy: {p['price']:.2f}  | Confiance≈ {prob}%  | Edge≈ {edge}%\n"
-                     f"• {('Match '+when) if when else ''}")
+                     f"• Pick: *{p['fav']}* | Cote≈{p['price']:.2f}{form_info}\n"
+                     f"• Match: {when}")
     lines.append("\n*Gestion du risque:* mise 1–2% par pari. Pas de martingale.")
     return "\n".join(lines)
