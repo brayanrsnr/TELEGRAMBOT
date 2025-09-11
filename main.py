@@ -7,7 +7,7 @@ import pytz
 from flask import Flask, jsonify
 from telegram.ext import Updater, CommandHandler
 
-from picks import build_daily_message
+from picks import build_daily_message, build_status
 
 # ------------- Config -------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -60,7 +60,7 @@ def cmd_sendnow(update, context):
 
 # ------------- Jobs -------------
 def job_daily(context):
-    msg = build_daily_message()from picks import build_daily_message, build_status
+msg = build_daily_message()
     context.bot.send_message(chat_id=CHANNEL_ID, text=msg, parse_mode="Markdown")
     _mark_sent_today()
 
